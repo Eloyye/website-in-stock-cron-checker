@@ -1,0 +1,141 @@
+service: in-stock-notification
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ${env:AWS_REGION, 'us-east-1'}
+  stage: ${opt:stage, 'prod'}
+  environment:
+    TARGET_URL: ${env:TARGET_URL, 'https://vaticpro.com/products/v-sol-pro-16mm?variant=62511728066719'}
+    TO_EMAIL: ${env:TO_EMAIL}
+    FROM_EMAIL: ${env:FROM_EMAIL}
+    AWS_REGION: ${env:AWS_REGION, 'us-east-1'}
+  # Enhanced security with least privilege access
+  iamRoleStatements:
+    # Restricted SES permissions to specific verified email addresses
+    - Effect: Allow
+      Action:
+        - ses:SendEmail
+        - ses:SendRawEmail
+      Resource:
+        - "arn:aws:ses:${self:provider.region}:*:identity/${env:FROM_EMAIL}"
+        - "arn:aws:ses:${self:provider.region}:*:identity/${env:TO_EMAIL}"
+    # CloudWatch Logs permissions
+    - Effect: Allow
+      Action:
+        - logs:CreateLogGroup
+        - logs:CreateLogStream
+        - logs:PutLogEvents
+      Resource: "arn:aws:logs:${self:provider.region}:*:*"
+  # Enhanced monitoring and error handling
+  logs:
+    restApi: true
+  tracing:
+    lambda: true # Enable AWS X-Ray tracing
+  environment:
+    _X_AMZN_TRACE_ID: ${env:_X_AMZN_TRACE_ID, ''}
+  deploymentBucket:
+    blockPublicAccess: true
+    serverSideEncryption: AES256
+  stackTags:
+    Project: in-stock-notification
+    Environment: ${self:provider.stage}
+    Security: high
+
+functions:
+  checkStock:
+    handler: src/handler.handler
+    description: Checks if '#add' element says 'Add to Cart' and is not locked, emails if available.
+    memorySize: 256
+    timeout: 30
+    # Enhanced error handling and retry configuration
+    deadLetterQueue:
+      targetArn: !GetAtt DeadLetterQueue.Arn
+    maximumRetryAttempts: 2
+    # Environment-specific log retention
+    logRetentionInDays: 30
+    events:
+      - schedule:
+          # Every 5 hours between 7 AM and 10 PM, local to America/Los_Angeles
+          rate: cron(0 7,12,17,22 ? * *)
+          enabled: true
+          timezone: America/Los_Angeles
+          input:
+            source: "scheduled-check"
+
+# CloudFormation resources for enhanced monitoring and security
+resources:
+  Resources:
+    # Dead Letter Queue for failed executions
+    DeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-dlq
+        MessageRetentionPeriod: 1209600 # 14 days
+        VisibilityTimeoutSeconds: 60
+
+    # CloudWatch Alarm for Lambda errors
+    LambdaErrorAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-lambda-errors
+        AlarmDescription: "Alert when Lambda function has errors"
+        MetricName: Errors
+        Namespace: AWS/Lambda
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        Dimensions:
+          - Name: FunctionName
+            Value: ${self:service}-${self:provider.stage}-checkStock
+        AlarmActions:
+          - !Ref ErrorNotificationTopic
+
+    # CloudWatch Alarm for Lambda duration
+    LambdaDurationAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-lambda-duration
+        AlarmDescription: "Alert when Lambda execution time is high"
+        MetricName: Duration
+        Namespace: AWS/Lambda
+        Statistic: Average
+        Period: 300
+        EvaluationPeriods: 2
+        Threshold: 25000 # 25 seconds (close to 30s timeout)
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        Dimensions:
+          - Name: FunctionName
+            Value: ${self:service}-${self:provider.stage}-checkStock
+
+    # SNS Topic for error notifications
+    ErrorNotificationTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${self:provider.stage}-errors
+        DisplayName: "Stock Check Lambda Errors"
+
+    # SNS Subscription for email notifications
+    ErrorNotificationSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref ErrorNotificationTopic
+        Protocol: email
+        Endpoint: ${env:TO_EMAIL}
+
+  Outputs:
+    # Export important ARNs for reference
+    LambdaFunctionArn:
+      Description: "Lambda Function ARN"
+      Value: !GetAtt CheckStockLambdaFunction.Arn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-lambda-arn
+
+    DeadLetterQueueUrl:
+      Description: "Dead Letter Queue URL"
+      Value: !Ref DeadLetterQueue
+      Export:
+        Name: ${self:service}-${self:provider.stage}-dlq-url
