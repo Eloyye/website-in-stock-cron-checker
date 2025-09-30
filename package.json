@@ -6,7 +6,8 @@
   "scripts": {
     "deploy": "serverless deploy",
     "remove": "serverless remove",
-    "invoke-local": "serverless invoke local -f checkStock"
+    "invoke-local": "serverless invoke local -f checkStock",
+    "build": "bun build src/handler.ts --outfile src/handler.cjs --format cjs --target node"
   },
   "dependencies": {
     "@aws-sdk/client-ses": "^3.654.0",
